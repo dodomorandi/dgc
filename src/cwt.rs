@@ -1,9 +1,12 @@
-use crate::DgcContainer;
+use crate::{DgcContainer, SignatureValidity, TrustList};
 use ciborium::{
     ser::into_writer,
     value::{Integer, Value},
 };
-use std::iter::FromIterator;
+use core::fmt;
+use ring::signature;
+use serde::{ser::SerializeSeq, Serialize};
+use std::{borrow::Cow, io};
 use std::{
     convert::{TryFrom, TryInto},
     ops::Not,
@@ -63,6 +66,9 @@ pub enum CwtParseError {
     /// The signature section is not a binary string
     #[error("The signature section is not a binary string")]
     SignatureNotBinary,
+
+    #[error("Invalid CBOR Web Token header: {0}")]
+    InvalidCwtHeader(#[from] InvalidCwt),
 }
 
 /// An enum representing the supported signing verification algorithms.
@@ -86,23 +92,38 @@ pub enum EcAlg {
     /// [rsa]: https://en.wikipedia.org/wiki/RSA_(cryptosystem)
     /// [sha2]: https://en.wikipedia.org/wiki/SHA-2
     Ps256,
-    /// Unknown algorithm
-    ///
-    /// The value is the COSE algorithm identifier defined by the IANA,
-    /// a complete list can be found [here](https://www.iana.org/assignments/cose/cose.xhtml)
-    Unknown(i128),
+    // /// Unknown algorithm
+    // ///
+    // /// The value is the COSE algorithm identifier defined by the IANA,
+    // /// a complete list can be found [here](https://www.iana.org/assignments/cose/cose.xhtml)
+    // Unknown(i128),
 }
 
-impl From<Integer> for EcAlg {
-    fn from(i: Integer) -> Self {
-        let u: i128 = i.into();
-        match u {
-            COSE_ES256 => EcAlg::Es256,
-            COSE_PS256 => EcAlg::Ps256,
-            _ => EcAlg::Unknown(u),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedECAlgorithm;
+
+impl TryFrom<Integer> for EcAlg {
+    type Error = UnsupportedECAlgorithm;
+
+    fn try_from(value: Integer) -> Result<Self, Self::Error> {
+        match value.into() {
+            COSE_ES256 => Ok(EcAlg::Es256),
+            COSE_PS256 => Ok(EcAlg::Ps256),
+            _ => Err(UnsupportedECAlgorithm),
         }
     }
 }
+
+// impl From<Integer> for EcAlg {
+//     fn from(i: Integer) -> Self {
+//         let u: i128 = i.into();
+//         match u {
+//             COSE_ES256 => EcAlg::Es256,
+//             COSE_PS256 => EcAlg::Ps256,
+//             _ => EcAlg::Unknown(u),
+//         }
+//     }
+// }
 
 /// The CWT header object.
 ///
@@ -114,53 +135,103 @@ impl From<Integer> for EcAlg {
 #[derive(Debug)]
 pub struct CwtHeader {
     /// The Key ID used for signing the certificate
-    pub kid: Option<Vec<u8>>,
+    pub kid: Vec<u8>,
     /// The signature algorithm used to sign the certificate
-    pub alg: Option<EcAlg>,
+    pub alg: EcAlg,
 }
 
 impl CwtHeader {
-    fn new() -> Self {
-        Self {
-            kid: None,
-            alg: None,
-        }
-    }
+    pub fn from_value_pairs<I>(pairs: I) -> Result<Self, InvalidCwt>
+    where
+        I: IntoIterator<Item = (Value, Value)>,
+    {
+        use InvalidCwt::*;
 
-    fn kid(&mut self, kid: Vec<u8>) {
-        self.kid = Some(kid);
-    }
+        let mut kid = None;
+        let mut alg = None;
 
-    fn alg(&mut self, alg: EcAlg) {
-        self.alg = Some(alg);
-    }
-}
-
-impl FromIterator<(Value, Value)> for CwtHeader {
-    fn from_iter<T: IntoIterator<Item = (Value, Value)>>(iter: T) -> Self {
-        // permissive parsing. We don't want to fail if we can't decode the header
-        let mut header = CwtHeader::new();
         // tries to find kid and alg and apply them to the header before returning it
-        for (key, val) in iter {
+        for (key, val) in pairs {
             if let Value::Integer(k) = key {
                 let k: i128 = k.into();
-                if k == COSE_HEADER_KEY_KID {
-                    // found kid
-                    if let Value::Bytes(kid) = val {
-                        header.kid(kid);
+                match k {
+                    COSE_HEADER_KEY_KID => {
+                        if kid.is_some() {
+                            return Err(MoreThanOneKid);
+                        }
+
+                        match val {
+                            Value::Bytes(b) => kid = Some(b),
+                            _ => return Err(InvalidKid),
+                        }
                     }
-                } else if k == COSE_HEADER_KEY_ALG {
-                    // found alg
-                    if let Value::Integer(raw_alg) = val {
-                        let alg: EcAlg = raw_alg.into();
-                        header.alg(alg);
+                    COSE_HEADER_KEY_ALG => {
+                        if alg.is_some() {
+                            return Err(MoreThanOneAlg);
+                        }
+
+                        match val {
+                            Value::Integer(i) => alg = Some(i.try_into().map_err(|_| InvalidAlg)?),
+                            _ => return Err(InvalidAlg),
+                        }
                     }
+                    _ => {}
                 }
             }
         }
-        header
+
+        match (kid, alg) {
+            (Some(kid), Some(alg)) => Ok(Self { kid, alg }),
+            (None, None) => Err(MissingKidAndAlg),
+            (None, _) => Err(MissingKid),
+            (_, None) => Err(MissingAlg),
+        }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+pub enum InvalidCwt {
+    #[error("invalid key ID")]
+    InvalidKid,
+    #[error("invalid algorithm")]
+    InvalidAlg,
+    #[error("key ID is missing")]
+    MissingKid,
+    #[error("more than one key ID found")]
+    MoreThanOneKid,
+    #[error("algorithm is missing")]
+    MissingAlg,
+    #[error("more than one algorithm found")]
+    MoreThanOneAlg,
+    #[error("both key ID and algorithm are missing")]
+    MissingKidAndAlg,
+}
+
+// impl FromIterator<(Value, Value)> for CwtHeader {
+//     fn from_iter<T: IntoIterator<Item = (Value, Value)>>(iter: T) -> Self {
+//         // permissive parsing. We don't want to fail if we can't decode the header
+//         let mut header = CwtHeader::new();
+//         // tries to find kid and alg and apply them to the header before returning it
+//         for (key, val) in iter {
+//             if let Value::Integer(k) = key {
+//                 let k: i128 = k.into();
+//                 if k == COSE_HEADER_KEY_KID {
+//                     // found kid
+//                     if let Value::Bytes(kid) = val {
+//                         header.kid(kid);
+//                     }
+//                 } else if k == COSE_HEADER_KEY_ALG {
+//                     // found alg
+//                     if let Value::Integer(raw_alg) = val {
+//                         let alg: EcAlg = raw_alg.into();
+//                         header.alg(alg);
+//                     }
+//                 }
+//             }
+//         }
+//         header
+//     }
+// }
 
 /// A representation of a CWT ([CBOR Web Token](https://datatracker.ietf.org/doc/html/rfc8392)).
 ///
@@ -182,18 +253,77 @@ pub struct Cwt {
 }
 
 impl Cwt {
+    pub fn serialize_into<W>(&self, writer: W) -> Result<(), ciborium::ser::Error<W::Error>>
+    where
+        W: ciborium_io::Write,
+        W::Error: fmt::Debug,
+    {
+        struct AsBytes<'a>(&'a [u8]);
+        impl Serialize for AsBytes<'_> {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_bytes(self.0)
+            }
+        }
+
+        let signature = (
+            // context of the signature
+            "Signature1",
+            // protected attributes from the body structure
+            AsBytes(&self.header_protected_raw),
+            // protected attributes from the application (these are not used in hcert so we keep
+            // them empty as per spec)
+            AsBytes(b""),
+            AsBytes(&self.payload_raw),
+        );
+
+        into_writer(&signature, writer)
+    }
+
     /// Creates the [sig structure](https://datatracker.ietf.org/doc/html/rfc8152#section-4.4) needed to be able
     /// to verify the signature against a public key.
-    pub fn make_sig_structure(&self) -> Vec<u8> {
-        let sig_structure_cbor = Value::Array(vec![
-            Value::Text(String::from("Signature1")), // context of the signature
-            Value::Bytes(self.header_protected_raw.clone()), // protected attributes from the body structure
-            Value::Bytes(vec![]), // protected attributes from the application (these are not used in hcert so we keep them empty as per spec)
-            Value::Bytes(self.payload_raw.clone()),
-        ]);
+    pub fn make_sig_structure(&self) -> Result<Vec<u8>, ciborium::ser::Error<io::Error>> {
         let mut sig_structure: Vec<u8> = vec![];
-        into_writer(&sig_structure_cbor, &mut sig_structure).unwrap();
-        sig_structure
+        self.serialize_into(&mut sig_structure)?;
+        Ok(sig_structure)
+    }
+
+    pub fn validate(&self, trustlist: &TrustList, buffer: &mut Vec<u8>) -> SignatureValidity {
+        macro_rules! ok {
+            ($expr:expr $(,)?) => {
+                match $expr {
+                    Ok(x) => x,
+                    Err(err) => return err,
+                }
+            };
+        }
+
+        let kid = &self.header.kid;
+        let key = ok!(trustlist
+            .get_key(kid)
+            .ok_or(SignatureValidity::KeyNotInTrustList(Cow::Borrowed(kid))));
+
+        // TODO: Can this fail?
+        let mut serialize_into_buffer = || self.serialize_into(&mut *buffer).unwrap();
+        let result = match self.header.alg {
+            EcAlg::Es256 => {
+                serialize_into_buffer();
+                signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_FIXED, key)
+                    .verify(buffer, &self.signature)
+            }
+            EcAlg::Ps256 => {
+                serialize_into_buffer();
+                signature::UnparsedPublicKey::new(&signature::RSA_PSS_2048_8192_SHA256, key)
+                    .verify(buffer, &self.signature)
+            }
+        };
+
+        match result {
+            Err(_) => SignatureValidity::Invalid,
+            Ok(_) => SignatureValidity::Valid,
+        }
     }
 }
 
@@ -283,10 +413,11 @@ impl TryFrom<&[u8]> for Cwt {
             .unwrap_or_default();
 
         // Take data from unprotected header first, then from the protected one
-        let header: CwtHeader = unprotected_header
-            .into_iter()
-            .chain(protected_header_values)
-            .collect();
+        let header = CwtHeader::from_value_pairs(
+            unprotected_header
+                .into_iter()
+                .chain(protected_header_values),
+        )?;
 
         let payload: DgcContainer =
             ciborium::de::from_reader(payload_raw.as_slice()).map_err(InvalidPayload)?;
@@ -326,11 +457,11 @@ mod tests {
 
         let cwt: Cwt = raw_cose_data.as_slice().try_into().unwrap();
 
-        assert_eq!(Some(expected_kid), cwt.header.kid);
-        assert_eq!(Some(expected_alg), cwt.header.alg);
+        assert_eq!(expected_kid, cwt.header.kid);
+        assert_eq!(expected_alg, cwt.header.alg);
         assert_eq!(
             expected_sig_structure,
-            hex::encode(cwt.make_sig_structure())
+            hex::encode(cwt.make_sig_structure().unwrap())
         );
     }
 }

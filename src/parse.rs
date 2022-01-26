@@ -1,6 +1,11 @@
-use crate::{Cwt, CwtParseError, DgcContainer, EcAlg, TrustList};
-use ring::signature;
-use std::{convert::TryInto, fmt::Display};
+use crate::{Cwt, CwtParseError, DgcContainer, TrustList};
+use flate2::read::ZlibDecoder;
+use std::{
+    borrow::Cow,
+    convert::TryInto,
+    fmt::Display,
+    io::{self, Read},
+};
 use thiserror::Error;
 
 /// Represents all the possible types of failures that can occure when parsing a certificate.
@@ -17,7 +22,7 @@ pub enum ParseError {
     Base45Decode(#[from] base45::DecodeError),
     /// Error decompressing using zlib inflate
     #[error("Could not decompress the data: {0}")]
-    Deflate(String),
+    Deflate(io::Error),
     /// Error decoding the CWT payload
     #[error("Could not decode CWT data: {0}")]
     CwtDecode(#[from] CwtParseError),
@@ -26,7 +31,7 @@ pub enum ParseError {
 /// Represents all the possible outcomes of trying to validate a signature
 /// for a given certificate.
 #[derive(Debug)]
-pub enum SignatureValidity {
+pub enum SignatureValidity<'a> {
     /// The signature is valid
     Valid,
     /// The signature is not valid
@@ -38,12 +43,12 @@ pub enum SignatureValidity {
     /// The signature in the certificate is malformed
     SignatureMalformed,
     /// The signature could not be validated because the signing algorithm is not supported
-    UnsupportedSigningAlgorithm(String),
+    UnsupportedSigningAlgorithm(i128),
     /// The signature could not be validated because the public key was not found in the given trustlist
-    KeyNotInTrustList(Vec<u8>),
+    KeyNotInTrustList(Cow<'a, [u8]>),
 }
 
-impl Display for SignatureValidity {
+impl Display for SignatureValidity<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use SignatureValidity::*;
         match self {
@@ -77,10 +82,25 @@ impl Display for SignatureValidity {
     }
 }
 
-impl SignatureValidity {
+impl SignatureValidity<'_> {
     /// Checks if the signature is valid
     pub fn is_valid(&self) -> bool {
         matches!(self, SignatureValidity::Valid)
+    }
+
+    /// Converts a borrowing type into an owned type.
+    pub fn into_owned(self) -> SignatureValidity<'static> {
+        use SignatureValidity::*;
+
+        match self {
+            KeyNotInTrustList(key) => KeyNotInTrustList(Cow::Owned(key.into_owned())),
+            Valid => Valid,
+            Invalid => Invalid,
+            MissingKid => MissingKid,
+            MissingSigningAlgorithm => MissingSigningAlgorithm,
+            SignatureMalformed => SignatureMalformed,
+            UnsupportedSigningAlgorithm(alg) => UnsupportedSigningAlgorithm(alg),
+        }
     }
 }
 
@@ -103,12 +123,16 @@ fn decode_base45(data: &str) -> Result<Vec<u8>, ParseError> {
     Ok(decoded)
 }
 
-fn decompress(data: Vec<u8>) -> Result<Vec<u8>, ParseError> {
-    let decompressed = inflate::inflate_bytes_zlib(&data).map_err(ParseError::Deflate)?;
+fn decompress(data: &[u8]) -> Result<Vec<u8>, ParseError> {
+    let mut decompressed = Vec::new();
+    let mut decoder = ZlibDecoder::new(data);
+    decoder
+        .read_to_end(&mut decompressed)
+        .map_err(ParseError::Deflate)?;
     Ok(decompressed)
 }
 
-fn parse_cwt_payload(data: Vec<u8>) -> Result<Cwt, ParseError> {
+fn parse_cwt_payload(data: &[u8]) -> Result<Cwt, ParseError> {
     let cwt: Cwt = data.try_into()?;
     Ok(cwt)
 }
@@ -155,49 +179,11 @@ fn parse_cwt_payload(data: Vec<u8>) -> Result<Cwt, ParseError> {
 pub fn validate(
     data: &str,
     trustlist: &TrustList,
-) -> Result<(DgcContainer, SignatureValidity), ParseError> {
+    buffer: &mut Vec<u8>,
+) -> Result<(Cwt, SignatureValidity<'static>), ParseError> {
     let cwt = decode_cwt(data)?;
-
-    let kid = match &cwt.header.kid {
-        None => return Ok((cwt.payload, SignatureValidity::MissingKid)),
-        Some(kid) => kid,
-    };
-
-    let key = match trustlist.get_key(kid) {
-        None => {
-            return Ok((
-                cwt.payload,
-                SignatureValidity::KeyNotInTrustList(kid.clone()),
-            ))
-        }
-        Some(key) => key,
-    };
-
-    let signature = &cwt.signature;
-    let data = cwt.make_sig_structure();
-    let result = match cwt.header.alg {
-        None => return Ok((cwt.payload, SignatureValidity::MissingSigningAlgorithm)),
-        Some(alg) => match alg {
-            EcAlg::Es256 => {
-                signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_FIXED, key)
-                    .verify(&data, signature)
-            }
-            EcAlg::Ps256 => {
-                signature::UnparsedPublicKey::new(&signature::RSA_PSS_2048_8192_SHA256, key)
-                    .verify(&data, signature)
-            }
-            EcAlg::Unknown(alg) => {
-                return Ok((
-                    cwt.payload,
-                    SignatureValidity::UnsupportedSigningAlgorithm(format!("{:?}", alg)),
-                ))
-            }
-        },
-    };
-    match result {
-        Err(_) => Ok((cwt.payload, SignatureValidity::Invalid)),
-        Ok(_) => Ok((cwt.payload, SignatureValidity::Valid)),
-    }
+    let validation = cwt.validate(trustlist, buffer).into_owned();
+    Ok((cwt, validation))
 }
 
 /// Decodes the certificate and returns the [`Cwt`] data contained in it.
@@ -212,10 +198,10 @@ pub fn decode_cwt(data: &str) -> Result<Cwt, ParseError> {
     let decoded = decode_base45(data)?;
 
     // decompress the data
-    let decompressed = decompress(decoded)?;
+    let decompressed = decompress(&decoded)?;
 
     // parse cose payload
-    let cwt = parse_cwt_payload(decompressed)?;
+    let cwt = parse_cwt_payload(&decompressed)?;
 
     Ok(cwt)
 }
@@ -266,7 +252,7 @@ mod tests {
     #[test]
     fn it_decompress() {
         let data = hex::decode("78dabbd4e2bb88c5e3a6a479fcc1e7db3631aa2d8864345ec222957073030f9b54c2755e1ec624c7104b46e6858c4b12cb1a5725a5e43126e526e6fa07b9eb1a1a1818181b18199a26951564191a1a5a1a9b581a189827a59464190185750d8c740d2d9292f3810624256756188606f9598586397b5a19185a398658191a5818985b9818bb599a38baba1ab8ba9a1a581abb39391b999a38b958181a2b3b25e516e4b886ea1bea1b19e81b9a1a592465165748fb66e665169714552ae4a72978a426e69464e828389602453213938a5398924ad2332d4c0c4c8d814e314bce4bcc5d929c965752ea1b1a1ce21ae416e4186ae3eeef1a1cece9e7ee1a94949657ea0bd49a5a94569458aaeb7e78dbe1f99979e9a945c9e9792519ee8e4e419eae3eae49e97919ee89494599a939a9c965a945a9867a467a86c929f9495986969616206f1a994538ac94cdbbd0368767c9f5ce2cf3eb55dbdf3be4a564aefdbb4beeb4717ecbf642d73dbf5af51f2f596f738a8fbfbce0e10193ab977e9dbaa1f9eddfb1689b60c59def4e750000f0cf8cab").unwrap();
-        let decompressed = hex::encode(decompress(data).unwrap());
+        let decompressed = hex::encode(decompress(&data).unwrap());
 
         let expected = "d2844da20448d919375fc1e7b6b20126a0590133a4041a60d9b00c061a60d70d0c01624154390103a101a4617681aa62646e01626d616d4f52472d3130303033303231356276706a313131393334393030376264746a323032312d30322d313862636f624154626369783155524e3a555643493a30313a41543a31303830373834334639344145453045453530393346424332353442443831332342626d706c45552f312f32302f31353238626973781b4d696e6973747279206f66204865616c74682c20417573747269616273640262746769383430353339303036636e616da463666e74754d5553544552465241553c474f455353494e47455262666e754d7573746572667261752d47c3b6c39f696e67657263676e74684741425249454c4562676e684761627269656c656376657265312e322e3163646f626a313939382d30322d32365840a91d6ed0869c0ca4d7896a37d77ab7ef406e6469adfdba1ecb336f84b77145bcfa852fe3a4af3cca0e0f7770e1c034d5d2facad829f6fec65b3c5321b9eeca88";
         assert_eq!(expected, decompressed);
@@ -275,7 +261,12 @@ mod tests {
     #[test]
     fn it_parses_cwt_payload() {
         let data = hex::decode("d2844da20448d919375fc1e7b6b20126a0590133a4041a60d9b00c061a60d70d0c01624154390103a101a4617681aa62646e01626d616d4f52472d3130303033303231356276706a313131393334393030376264746a323032312d30322d313862636f624154626369783155524e3a555643493a30313a41543a31303830373834334639344145453045453530393346424332353442443831332342626d706c45552f312f32302f31353238626973781b4d696e6973747279206f66204865616c74682c20417573747269616273640262746769383430353339303036636e616da463666e74754d5553544552465241553c474f455353494e47455262666e754d7573746572667261752d47c3b6c39f696e67657263676e74684741425249454c4562676e684761627269656c656376657265312e322e3163646f626a313939382d30322d32365840a91d6ed0869c0ca4d7896a37d77ab7ef406e6469adfdba1ecb336f84b77145bcfa852fe3a4af3cca0e0f7770e1c034d5d2facad829f6fec65b3c5321b9eeca88").unwrap();
-        let sig_structure = hex::encode(parse_cwt_payload(data).unwrap().make_sig_structure());
+        let sig_structure = hex::encode(
+            parse_cwt_payload(&data)
+                .unwrap()
+                .make_sig_structure()
+                .unwrap(),
+        );
 
         let expected = "846a5369676e6174757265314da20448d919375fc1e7b6b2012640590133a4041a60d9b00c061a60d70d0c01624154390103a101a4617681aa62646e01626d616d4f52472d3130303033303231356276706a313131393334393030376264746a323032312d30322d313862636f624154626369783155524e3a555643493a30313a41543a31303830373834334639344145453045453530393346424332353442443831332342626d706c45552f312f32302f31353238626973781b4d696e6973747279206f66204865616c74682c20417573747269616273640262746769383430353339303036636e616da463666e74754d5553544552465241553c474f455353494e47455262666e754d7573746572667261752d47c3b6c39f696e67657263676e74684741425249454c4562676e684761627269656c656376657265312e322e3163646f626a313939382d30322d3236";
         assert_eq!(expected, sig_structure);
@@ -301,7 +292,7 @@ mod tests {
             .add_key_from_base64(kid.as_slice(), key_data)
             .unwrap();
 
-        let (_, signature_validity) = validate(data, &trustlist).unwrap();
+        let (_, signature_validity) = validate(data, &trustlist, &mut Vec::new()).unwrap();
         assert!(matches!(signature_validity, SignatureValidity::Valid));
     }
 }

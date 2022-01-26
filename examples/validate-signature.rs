@@ -13,7 +13,8 @@ fn main() {
 
     // Now we can validate the signature (this returns)
     let (certificate_container, signature_validity) =
-        dgc::validate(raw_certificate_data, &trustlist).expect("Cannot parse certificate data");
+        dgc::validate(raw_certificate_data, &trustlist, &mut Vec::new())
+            .expect("Cannot parse certificate data");
 
     println!("{:#?}", &certificate_container);
 

@@ -673,7 +673,7 @@ fn test_case(#[case] test_file: &str) {
             .add_key_from_certificate(test_data["TESTCTX"]["CERTIFICATE"].as_str().unwrap())
             .unwrap();
 
-        let (_, signature_validity) = validate(raw_hcert, &trustlist).unwrap();
+        let (_, signature_validity) = validate(raw_hcert, &trustlist, &mut Vec::new()).unwrap();
         let expected_verify = test_data["EXPECTEDRESULTS"]["EXPECTEDVERIFY"]
             .as_bool()
             .unwrap_or(true);
