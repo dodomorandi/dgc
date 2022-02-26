@@ -1,4 +1,5 @@
-use crate::lookup_value;
+use crate::{deserialize_partial_datetime, lookup_value};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fmt;
@@ -27,8 +28,8 @@ pub struct Vaccination {
     #[serde(rename = "sd")]
     pub total_doses: usize,
     /// ISO8601 complete date: Date of Vaccination
-    #[serde(rename = "dt")]
-    pub date: Cow<'static, str>,
+    #[serde(rename = "dt", deserialize_with = "deserialize_partial_datetime")]
+    pub date: DateTime<Utc>,
     /// Country of Vaccination
     #[serde(rename = "co")]
     pub country: Cow<'static, str>,

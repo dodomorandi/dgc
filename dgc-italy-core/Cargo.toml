@@ -9,6 +9,7 @@ readme = "README.md"
 license = "MIT"
 
 [dependencies]
+chrono = "0.4.19"
 dgc = { path = "../dgc" }
 serde = { version = "1.0.136", features = ["derive"] }
 

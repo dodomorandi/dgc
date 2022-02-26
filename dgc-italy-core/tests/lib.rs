@@ -3,6 +3,7 @@ use std::borrow::Cow;
 use dgc_italy_core::settings::*;
 
 #[test]
+#[allow(deprecated)]
 fn settings() {
     const RAW_SETTINGS: &str = include_str!("data/settings.json");
 
@@ -125,6 +126,7 @@ fn settings() {
                     start_day: 0,
                     end_day: 180
                 },
+                school_end_day: 120,
             },
             generic_vaccine: GenericVaccine {
                 complete_it: Interval {
@@ -142,8 +144,15 @@ fn settings() {
                 booster_not_it: Interval {
                     start_day: 0,
                     end_day: 270,
-                }
+                },
+                school_end_day: 120,
+                complete_extended_ema_end_day: 270,
             },
+            ema_vaccines: EmaVaccines(
+                "EU/1/20/1525;EU/1/20/1507;EU/1/20/1528;EU/1/21/1529;Covishield;R-COVI;\
+                 Covid-19-recombinant"
+                    .into()
+            ),
             unknown: Vec::new(),
         }
     );

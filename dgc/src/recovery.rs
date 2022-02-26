@@ -1,4 +1,5 @@
-use crate::lookup_value;
+use crate::{deserialize_partial_datetime, lookup_value};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fmt;
@@ -21,14 +22,14 @@ pub struct Recovery {
     #[serde(rename = "is")]
     pub issuer: Cow<'static, str>,
     /// ISO 8601 complete date: Certificate Valid From
-    #[serde(rename = "df")]
-    pub valid_from: Cow<'static, str>,
+    #[serde(rename = "df", deserialize_with = "deserialize_partial_datetime")]
+    pub valid_from: DateTime<Utc>,
     /// ISO 8601 complete date: Certificate Valid Until
-    #[serde(rename = "du")]
-    pub valid_until: Cow<'static, str>,
+    #[serde(rename = "du", deserialize_with = "deserialize_partial_datetime")]
+    pub valid_until: DateTime<Utc>,
     /// Unique Certificate Identifier, UVCI
     #[serde(rename = "ci")]
-    pub id: Cow<'static, str>,
+    pub id: Id<'static>,
 }
 
 impl Recovery {
@@ -46,6 +47,23 @@ impl fmt::Display for Recovery {
             f,
             "Recovered from {} on {}. Issued by {}",
             self.targeted_disease, self.result_date, self.issuer
+        )
+    }
+}
+
+/// A recovery OID
+///
+/// Just a wrapped [`Cow`] with some useful capabilities.
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Id<'a>(pub Cow<'a, str>);
+
+impl Id<'_> {
+    /// Return whether the current OID is a recovery type.
+    #[inline]
+    pub fn is_recovery(&self) -> bool {
+        matches!(
+            &*self.0,
+            "1.3.6.1.4.1.1847.2021.1.3" | "1.3.6.1.4.1.0.1847.2021.1.3"
         )
     }
 }

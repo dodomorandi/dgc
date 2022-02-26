@@ -1,4 +1,5 @@
-use crate::lookup_value;
+use crate::{deserialize_partial_datetime, lookup_value};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fmt;
@@ -21,8 +22,8 @@ pub struct Test {
     #[serde(rename = "ma", skip_serializing_if = "Option::is_none")]
     pub manufacturer: Option<Cow<'static, str>>,
     /// Date/Time of Sample Collection
-    #[serde(rename = "sc")]
-    pub date_of_collection: Cow<'static, str>,
+    #[serde(rename = "sc", deserialize_with = "deserialize_partial_datetime")]
+    pub date_of_collection: DateTime<Utc>,
     /// Date/Time of Test Result
     /// Deprecated in v1.3.0 of the schema
     #[serde(rename = "dr", skip_serializing_if = "Option::is_none")]

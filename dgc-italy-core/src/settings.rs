@@ -32,6 +32,8 @@ pub struct Settings<'a> {
     /// Interval settings related to generic vaccine.
     pub generic_vaccine: GenericVaccine,
 
+    pub ema_vaccines: EmaVaccines<'a>,
+
     /// A list of unknown settings.
     pub unknown: Vec<RawSetting<'a>>,
 }
@@ -44,6 +46,7 @@ struct PartialSettings<'a> {
     tests: PartialTests,
     recovery: PartialRecovery,
     generic_vaccine: PartialGenericVaccine,
+    ema_vaccines: Option<&'a str>,
     unknown: Vec<RawSetting<'a>>,
 }
 
@@ -88,7 +91,8 @@ impl<'a> PartialSettings<'a> {
                 | RecoveryCertStartDayIt
                 | RecoveryCertEndDayIt
                 | RecoveryCertStartDayNotIt
-                | RecoveryCertEndDayNotIt => {
+                | RecoveryCertEndDayNotIt
+                | RecoveryCertEndDaySchool => {
                     let recovery = &mut self.recovery;
                     InnerField::U16(match name {
                         RecoveryCertStartDay => &mut recovery.cert.start_day,
@@ -99,6 +103,7 @@ impl<'a> PartialSettings<'a> {
                         RecoveryCertEndDayIt => &mut recovery.cert_it.end_day,
                         RecoveryCertStartDayNotIt => &mut recovery.cert_not_it.start_day,
                         RecoveryCertEndDayNotIt => &mut recovery.cert_not_it.end_day,
+                        RecoveryCertEndDaySchool => &mut recovery.school_end_day,
                         _ => unreachable!(),
                     })
                 }
@@ -109,7 +114,9 @@ impl<'a> PartialSettings<'a> {
                 | VaccineStartDayBoosterIt
                 | VaccineEndDayBoosterIt
                 | VaccineStartDayBoosterNotIt
-                | VaccineEndDayBoosterNotIt => {
+                | VaccineEndDayBoosterNotIt
+                | VaccineEndDaySchool
+                | VaccineEndDayCompleteExtendedEma => {
                     let vaccine = &mut self.generic_vaccine;
                     InnerField::U16(match name {
                         VaccineStartDayCompleteIt => &mut vaccine.complete_it.start_day,
@@ -120,9 +127,14 @@ impl<'a> PartialSettings<'a> {
                         VaccineEndDayBoosterIt => &mut vaccine.booster_it.end_day,
                         VaccineStartDayBoosterNotIt => &mut vaccine.booster_not_it.start_day,
                         VaccineEndDayBoosterNotIt => &mut vaccine.booster_not_it.end_day,
+                        VaccineEndDaySchool => &mut vaccine.school_end_day,
+                        VaccineEndDayCompleteExtendedEma => {
+                            &mut vaccine.complete_extended_ema_end_day
+                        }
                         _ => unreachable!(),
                     })
                 }
+                EmaVaccines => InnerField::Str(&mut self.ema_vaccines),
                 VaccineStartDayComplete
                 | VaccineEndDayComplete
                 | VaccineStartDayNotComplete
@@ -335,6 +347,7 @@ impl<'de: 'a, 'a> Deserialize<'de> for Settings<'a> {
             tests,
             recovery,
             generic_vaccine,
+            ema_vaccines,
             unknown,
         } = deserializer.deserialize_seq(SettingsVisitor)?;
 
@@ -345,6 +358,9 @@ impl<'de: 'a, 'a> Deserialize<'de> for Settings<'a> {
         let min_versions = min_versions.into_complete().map_err(de::Error::custom)?;
         let tests = tests.into_complete().map_err(de::Error::custom)?;
         let recovery = recovery.into_complete().map_err(de::Error::custom)?;
+        let ema_vaccines = ema_vaccines
+            .map(|ema_vaccines| EmaVaccines(ema_vaccines.into()))
+            .ok_or_else(|| de::Error::custom(IncompleteSettings::MissingEmaVaccines))?;
         let generic_vaccine = generic_vaccine.into_complete().map_err(de::Error::custom)?;
 
         Ok(Self {
@@ -354,6 +370,7 @@ impl<'de: 'a, 'a> Deserialize<'de> for Settings<'a> {
             tests,
             recovery,
             generic_vaccine,
+            ema_vaccines,
             unknown,
         })
     }
@@ -655,13 +672,18 @@ struct PartialTestData {
 
 // FIXME: what's the meaning of these fields?
 /// Settings for COVID-19 recovery.
-#[allow(missing_docs)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Recovery {
+    /// Recovery data.
+    #[deprecated(note = "Use `cert_it` or `cert_not_it` instead.")]
     pub cert: Interval,
+    /// Post-vaccination recovery data.
     pub pv_cert: Interval,
+    /// Recovery data for Italian certificates.
     pub cert_it: Interval,
+    /// Recovery data for **not** Italian certificates.
     pub cert_not_it: Interval,
+    pub school_end_day: u16,
 }
 
 #[derive(Debug, Default)]
@@ -670,6 +692,7 @@ struct PartialRecovery {
     pv_cert: PartialInterval,
     cert_it: PartialInterval,
     cert_not_it: PartialInterval,
+    school_end_day: Option<u16>,
 }
 
 impl PartialRecovery {
@@ -682,6 +705,7 @@ impl PartialRecovery {
             pv_cert,
             cert_it,
             cert_not_it,
+            school_end_day,
         } = self;
 
         let cert = cert.into_complete(
@@ -708,12 +732,20 @@ impl PartialRecovery {
             RecoveryCertEndDayNotIt,
             IncompleteSettings::IncompleteRecovery,
         )?;
+        let school_end_day = school_end_day.ok_or({
+            IncompleteSettings::IncompleteRecovery(IncompleteSetting {
+                setting: Generic,
+                missing_field: RecoveryCertEndDaySchool,
+            })
+        })?;
 
+        #[allow(deprecated)]
         Ok(Recovery {
             cert,
             pv_cert,
             cert_it,
             cert_not_it,
+            school_end_day,
         })
     }
 }
@@ -732,6 +764,10 @@ pub struct GenericVaccine {
 
     /// Settings for a _booster_ vaccination cycle (complete + dose/recovery) not in Italy.
     pub booster_not_it: Interval,
+
+    pub school_end_day: u16,
+
+    pub complete_extended_ema_end_day: u16,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
@@ -740,6 +776,8 @@ struct PartialGenericVaccine {
     pub booster_it: PartialInterval,
     pub complete_not_it: PartialInterval,
     pub booster_not_it: PartialInterval,
+    pub school_end_day: Option<u16>,
+    pub complete_extended_ema_end_day: Option<u16>,
 }
 
 impl PartialGenericVaccine {
@@ -752,6 +790,8 @@ impl PartialGenericVaccine {
             booster_it,
             complete_not_it,
             booster_not_it,
+            school_end_day,
+            complete_extended_ema_end_day,
         } = self;
 
         let complete_it = complete_it.into_complete(
@@ -778,12 +818,26 @@ impl PartialGenericVaccine {
             VaccineEndDayBoosterNotIt,
             IncompleteSettings::IncompleteGenericVaccine,
         )?;
+        let school_end_day = school_end_day.ok_or({
+            IncompleteSettings::IncompleteGenericVaccine(IncompleteSetting {
+                setting: Generic,
+                missing_field: VaccineEndDaySchool,
+            })
+        })?;
+        let complete_extended_ema_end_day = complete_extended_ema_end_day.ok_or({
+            IncompleteSettings::IncompleteGenericVaccine(IncompleteSetting {
+                setting: Generic,
+                missing_field: VaccineEndDayCompleteExtendedEma,
+            })
+        })?;
 
         Ok(GenericVaccine {
             complete_it,
             booster_it,
             complete_not_it,
             booster_not_it,
+            school_end_day,
+            complete_extended_ema_end_day,
         })
     }
 }
@@ -950,6 +1004,12 @@ pub enum SettingName {
     VaccineStartDayBoosterNotIt,
     #[serde(rename = "vaccine_end_day_booster_NOT_IT")]
     VaccineEndDayBoosterNotIt,
+    RecoveryCertEndDaySchool,
+    VaccineEndDaySchool,
+    #[serde(rename = "vaccine_end_day_complete_extended_EMA")]
+    VaccineEndDayCompleteExtendedEma,
+    #[serde(rename = "EMA_vaccines")]
+    EmaVaccines,
 }
 
 impl SettingName {
@@ -985,6 +1045,10 @@ impl SettingName {
             VaccineEndDayBoosterIt => "vaccine_end_day_booster_IT",
             VaccineStartDayBoosterNotIt => "vaccine_start_day_booster_NOT_IT",
             VaccineEndDayBoosterNotIt => "vaccine_end_day_booster_NOT_IT",
+            RecoveryCertEndDaySchool => "recovery_cert_end_day_school",
+            VaccineEndDaySchool => "vaccine_end_day_school",
+            VaccineEndDayCompleteExtendedEma => "vaccine_end_day_complete_extended_EMA",
+            EmaVaccines => "EMA_vaccines",
         }
     }
 }
@@ -1015,6 +1079,8 @@ pub enum IncompleteSettings {
 
     /// Generic vaccine section is incomplete.
     IncompleteGenericVaccine(IncompleteSetting),
+
+    MissingEmaVaccines,
 }
 
 impl fmt::Display for IncompleteSettings {
@@ -1023,6 +1089,7 @@ impl fmt::Display for IncompleteSettings {
 
         match self {
             MissingDenyList => f.write_str("UVCI deny list is missing"),
+            MissingEmaVaccines => f.write_str("EMA vaccines list is missing"),
             IncompleteVaccine(incomplete)
             | IncompleteMinVersion(incomplete)
             | IncompleteTest(incomplete)
@@ -1035,7 +1102,7 @@ impl fmt::Display for IncompleteSettings {
                 IncompleteGenericVaccine(_) => {
                     write!(f, "incomplete generic vaccine, {}", incomplete)
                 }
-                MissingDenyList => unreachable!(),
+                MissingDenyList | MissingEmaVaccines => unreachable!(),
             },
         }
     }
@@ -1061,8 +1128,13 @@ impl fmt::Display for IncompleteSetting {
     }
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EmaVaccines<'a>(pub Cow<'a, str>);
+
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
+
     use super::*;
 
     #[test]
@@ -1432,6 +1504,7 @@ mod tests {
                     start_day: Some(7),
                     end_day: Some(8),
                 },
+                school_end_day: Some(9),
             }
             .into_complete()
             .unwrap(),
@@ -1452,6 +1525,7 @@ mod tests {
                     start_day: 7,
                     end_day: 8,
                 },
+                school_end_day: 9,
             }
         );
 
@@ -1473,6 +1547,7 @@ mod tests {
                     start_day: Some(7),
                     end_day: Some(8),
                 },
+                school_end_day: Some(9),
             }
             .into_complete()
             .unwrap_err(),
@@ -1500,6 +1575,7 @@ mod tests {
                     start_day: Some(7),
                     end_day: Some(8),
                 },
+                school_end_day: Some(9),
             }
             .into_complete()
             .unwrap_err(),
@@ -1527,6 +1603,7 @@ mod tests {
                     start_day: Some(7),
                     end_day: Some(8),
                 },
+                school_end_day: Some(9),
             }
             .into_complete()
             .unwrap_err(),
@@ -1554,6 +1631,7 @@ mod tests {
                     start_day: Some(7),
                     end_day: Some(8),
                 },
+                school_end_day: Some(9),
             }
             .into_complete()
             .unwrap_err(),
@@ -1581,6 +1659,7 @@ mod tests {
                     start_day: Some(7),
                     end_day: Some(8),
                 },
+                school_end_day: Some(9),
             }
             .into_complete()
             .unwrap_err(),
@@ -1608,6 +1687,7 @@ mod tests {
                     start_day: Some(7),
                     end_day: Some(8),
                 },
+                school_end_day: Some(9),
             }
             .into_complete()
             .unwrap_err(),
@@ -1635,6 +1715,7 @@ mod tests {
                     start_day: None,
                     end_day: Some(8),
                 },
+                school_end_day: Some(9),
             }
             .into_complete()
             .unwrap_err(),
@@ -1662,12 +1743,41 @@ mod tests {
                     start_day: Some(7),
                     end_day: None,
                 },
+                school_end_day: Some(9),
             }
             .into_complete()
             .unwrap_err(),
             IncompleteSettings::IncompleteRecovery(IncompleteSetting {
                 setting: SettingType::Generic,
                 missing_field: SettingName::RecoveryCertEndDayNotIt,
+            })
+        );
+
+        assert_eq!(
+            PartialRecovery {
+                cert: PartialInterval {
+                    start_day: Some(1),
+                    end_day: Some(2),
+                },
+                pv_cert: PartialInterval {
+                    start_day: Some(3),
+                    end_day: Some(4),
+                },
+                cert_it: PartialInterval {
+                    start_day: Some(5),
+                    end_day: Some(6),
+                },
+                cert_not_it: PartialInterval {
+                    start_day: Some(7),
+                    end_day: Some(8),
+                },
+                school_end_day: None,
+            }
+            .into_complete()
+            .unwrap_err(),
+            IncompleteSettings::IncompleteRecovery(IncompleteSetting {
+                setting: SettingType::Generic,
+                missing_field: SettingName::RecoveryCertEndDaySchool,
             })
         );
     }
@@ -1692,6 +1802,8 @@ mod tests {
                     start_day: Some(7),
                     end_day: Some(8),
                 },
+                school_end_day: Some(9),
+                complete_extended_ema_end_day: Some(10),
             }
             .into_complete()
             .unwrap(),
@@ -1712,6 +1824,8 @@ mod tests {
                     start_day: 7,
                     end_day: 8,
                 },
+                school_end_day: 9,
+                complete_extended_ema_end_day: 10,
             }
         );
 
@@ -1733,6 +1847,8 @@ mod tests {
                     start_day: Some(7),
                     end_day: Some(8),
                 },
+                school_end_day: Some(9),
+                complete_extended_ema_end_day: Some(10),
             }
             .into_complete()
             .unwrap_err(),
@@ -1760,6 +1876,8 @@ mod tests {
                     start_day: Some(7),
                     end_day: Some(8),
                 },
+                school_end_day: Some(9),
+                complete_extended_ema_end_day: Some(10),
             }
             .into_complete()
             .unwrap_err(),
@@ -1787,6 +1905,8 @@ mod tests {
                     start_day: Some(7),
                     end_day: Some(8),
                 },
+                school_end_day: Some(9),
+                complete_extended_ema_end_day: Some(10),
             }
             .into_complete()
             .unwrap_err(),
@@ -1814,6 +1934,8 @@ mod tests {
                     start_day: Some(7),
                     end_day: Some(8),
                 },
+                school_end_day: Some(9),
+                complete_extended_ema_end_day: Some(10),
             }
             .into_complete()
             .unwrap_err(),
@@ -1841,6 +1963,8 @@ mod tests {
                     start_day: Some(7),
                     end_day: Some(8),
                 },
+                school_end_day: Some(9),
+                complete_extended_ema_end_day: Some(10),
             }
             .into_complete()
             .unwrap_err(),
@@ -1868,6 +1992,8 @@ mod tests {
                     start_day: Some(7),
                     end_day: Some(8),
                 },
+                school_end_day: Some(9),
+                complete_extended_ema_end_day: Some(10),
             }
             .into_complete()
             .unwrap_err(),
@@ -1895,6 +2021,8 @@ mod tests {
                     start_day: None,
                     end_day: Some(8),
                 },
+                school_end_day: Some(9),
+                complete_extended_ema_end_day: Some(10),
             }
             .into_complete()
             .unwrap_err(),
@@ -1922,12 +2050,72 @@ mod tests {
                     start_day: Some(7),
                     end_day: None,
                 },
+                school_end_day: Some(9),
+                complete_extended_ema_end_day: Some(10),
             }
             .into_complete()
             .unwrap_err(),
             IncompleteSettings::IncompleteGenericVaccine(IncompleteSetting {
                 setting: SettingType::Generic,
                 missing_field: SettingName::VaccineEndDayBoosterNotIt,
+            })
+        );
+
+        assert_eq!(
+            PartialGenericVaccine {
+                complete_it: PartialInterval {
+                    start_day: Some(1),
+                    end_day: Some(2),
+                },
+                booster_it: PartialInterval {
+                    start_day: Some(3),
+                    end_day: Some(4),
+                },
+                complete_not_it: PartialInterval {
+                    start_day: Some(5),
+                    end_day: Some(6),
+                },
+                booster_not_it: PartialInterval {
+                    start_day: Some(7),
+                    end_day: Some(8),
+                },
+                school_end_day: None,
+                complete_extended_ema_end_day: Some(10),
+            }
+            .into_complete()
+            .unwrap_err(),
+            IncompleteSettings::IncompleteGenericVaccine(IncompleteSetting {
+                setting: SettingType::Generic,
+                missing_field: SettingName::VaccineEndDaySchool,
+            })
+        );
+
+        assert_eq!(
+            PartialGenericVaccine {
+                complete_it: PartialInterval {
+                    start_day: Some(1),
+                    end_day: Some(2),
+                },
+                booster_it: PartialInterval {
+                    start_day: Some(3),
+                    end_day: Some(4),
+                },
+                complete_not_it: PartialInterval {
+                    start_day: Some(5),
+                    end_day: Some(6),
+                },
+                booster_not_it: PartialInterval {
+                    start_day: Some(7),
+                    end_day: Some(8),
+                },
+                school_end_day: Some(9),
+                complete_extended_ema_end_day: None,
+            }
+            .into_complete()
+            .unwrap_err(),
+            IncompleteSettings::IncompleteGenericVaccine(IncompleteSetting {
+                setting: SettingType::Generic,
+                missing_field: SettingName::VaccineEndDayCompleteExtendedEma,
             })
         );
     }

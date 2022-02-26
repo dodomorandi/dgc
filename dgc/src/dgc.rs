@@ -1,7 +1,9 @@
-use std::borrow::Cow;
 use std::fmt;
+use std::{borrow::Cow, ops::Not};
 
 use crate::{Recovery, Test, Vaccination};
+use chrono::NaiveDate;
+use serde::de;
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Contains all the info related to the subject name (forename, surname, etc.).
@@ -51,8 +53,8 @@ pub struct Dgc {
     #[serde(rename = "nam")]
     pub name: DgcName,
     /// Date of Birth of the person addressed in the DGC. ISO 8601 date format restricted to range 1900-2099 or empty
-    #[serde(rename = "dob")]
-    pub date_of_birth: Cow<'static, str>,
+    #[serde(rename = "dob", deserialize_with = "deserialize_date_of_birth")]
+    pub date_of_birth: Option<NaiveDate>,
     /// Test Group
     #[serde(
         rename = "t",
@@ -79,9 +81,46 @@ pub struct Dgc {
     pub recoveries: Vec<Recovery>,
 }
 
+fn deserialize_date_of_birth<'de, D>(deserializer: D) -> Result<Option<NaiveDate>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = dbg!(Cow::<str>::deserialize(deserializer))?;
+
+    let mut date_part_iter = raw.splitn(3, '-');
+    let year = match date_part_iter.next() {
+        Some(year) => year.parse().map_err(de::Error::custom)?,
+        None => return Ok(None),
+    };
+
+    if (1900..=2099).contains(&year).not() {
+        return Err(de::Error::custom("invalid year"));
+    }
+
+    let month = match date_part_iter.next() {
+        Some(month) => match month.parse() {
+            Ok(month) if (1..=12).contains(&month) => month,
+            _ => return Err(de::Error::custom("invalid month")),
+        },
+        None => return Ok(Some(NaiveDate::from_ymd(year, 1, 1))),
+    };
+
+    match date_part_iter.next() {
+        Some(day) => match day.parse() {
+            Ok(day) if (1..=31).contains(&day) => Ok(Some(NaiveDate::from_ymd(year, month, day))),
+            _ => Err(de::Error::custom("invalid day")),
+        },
+        None => Ok(Some(NaiveDate::from_ymd(year, month, 1))),
+    }
+}
+
 impl fmt::Display for Dgc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "{} ({})", self.name, self.date_of_birth)?;
+        write!(f, "{}", self.name)?;
+        if let Some(date_of_birth) = self.date_of_birth {
+            write!(f, " ({})", date_of_birth)?;
+        }
+        writeln!(f)?;
         for test in &self.tests {
             writeln!(f, "{}", test)?;
         }
@@ -111,6 +150,8 @@ impl Dgc {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{offset, DateTime, NaiveDate, Utc};
+
     use super::*;
 
     #[test]
@@ -124,11 +165,14 @@ mod tests {
                 forename_standard: Some("ALSTON".into()),
                 surname_standard: "BLAKE".into(),
             },
-            date_of_birth: "1990-01-01".into(),
+            date_of_birth: Some(NaiveDate::from_ymd(1990, 1, 1)),
             tests: vec![Test {
                 targeted_disease: "840539006".into(),
                 test_type: "LP6464-4".into(),
-                date_of_collection: "2021-10-09T12:03:12Z".into(),
+                date_of_collection: DateTime::from_utc(
+                    NaiveDate::from_ymd(2021, 10, 9).and_hms(12, 3, 12),
+                    offset::Utc,
+                ),
                 result: "260415000".into(),
                 testing_centre: Some("Alhosn One Day Surgery".into()),
                 country: "AE".into(),
@@ -181,12 +225,18 @@ mod tests {
         assert_eq!(cert.name.surname_standard, "DI<CAPRIO");
         assert_eq!(cert.name.forename, Some("Marilù Teresa".into()));
         assert_eq!(cert.name.forename_standard, Some("MARILU<TERESA".into()));
-        assert_eq!(cert.date_of_birth, "1977-06-16");
+        assert_eq!(cert.date_of_birth, Some(NaiveDate::from_ymd(1977, 6, 16)));
         assert_eq!(cert.tests[0].targeted_disease, "840539006");
         assert_eq!(cert.tests[0].test_type, "LP6464-4");
         assert_eq!(cert.tests[0].name, Some("Roche LightCycler qPCR".into()));
         assert_eq!(cert.tests[0].manufacturer, Some("1232".into()));
-        assert_eq!(cert.tests[0].date_of_collection, "2021-05-03T10:27:15Z");
+        assert_eq!(
+            cert.tests[0].date_of_collection,
+            DateTime::<Utc>::from_utc(
+                NaiveDate::from_ymd(2021, 5, 3).and_hms(10, 27, 15),
+                offset::Utc,
+            )
+        );
         assert_eq!(
             cert.tests[0].date_of_result,
             Some("2021-05-11T12:27:15Z".into())
@@ -236,7 +286,7 @@ mod tests {
         assert_eq!(cert.name.surname_standard, "DI<CAPRIO");
         assert_eq!(cert.name.forename, Some("Marilù Teresa".into()));
         assert_eq!(cert.name.forename_standard, Some("MARILU<TERESA".into()));
-        assert_eq!(cert.date_of_birth, "1977-06-16");
+        assert_eq!(cert.date_of_birth, Some(NaiveDate::from_ymd(1977, 6, 16)));
         assert_eq!(cert.tests[0].targeted_disease, "COVID-19");
         assert_eq!(
             cert.tests[0].test_type,
@@ -247,7 +297,13 @@ mod tests {
             cert.tests[0].manufacturer,
             Some("Abbott Rapid Diagnostics, Panbio COVID-19 Ag Rapid Test".into())
         );
-        assert_eq!(cert.tests[0].date_of_collection, "2021-05-03T10:27:15Z");
+        assert_eq!(
+            cert.tests[0].date_of_collection,
+            DateTime::<Utc>::from_utc(
+                NaiveDate::from_ymd(2021, 5, 3).and_hms(10, 27, 15),
+                offset::Utc,
+            )
+        );
         assert_eq!(
             cert.tests[0].date_of_result,
             Some("2021-05-11T12:27:15Z".into())
@@ -293,6 +349,6 @@ mod tests {
         let mut cert: Dgc = serde_json::from_str(json_data).unwrap();
         cert.expand_values();
         let display = format!("{}", cert);
-        assert_eq!(display, "Marilù Teresa Di Caprio (1977-06-16)\nTEST: COVID-19 Not detected on 2021-05-03T10:27:15Z. Issued by Italy\n");
+        assert_eq!(display, "Marilù Teresa Di Caprio (1977-06-16)\nTEST: COVID-19 Not detected on 2021-05-03 10:27:15 UTC. Issued by Italy\n");
     }
 }
